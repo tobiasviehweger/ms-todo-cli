@@ -10,7 +10,8 @@ A command-line interface for Microsoft To Do, built with TypeScript and Node.js.
 - Manage tasks (create, update, complete, list, get)
 - Manage task steps / checklist items (create, update, complete, delete, list)
 - JSON output for easy scripting and integration
-- MSAL token cache stored in `~/.ms-todo-cli/msal-cache.json` (mode 0o600)
+- Multiple Microsoft accounts with user-defined profiles and isolated token caches
+- Private authentication storage under `~/.ms-todo-cli/` (directories 0o700, files 0o600)
 
 ## Installation
 
@@ -49,7 +50,8 @@ To use this CLI, you need to register an application in Azure Active Directory:
 
 | Variable | Description | Required |
 |---|---|---|
-| `MS_TODO_CLIENT_ID` | Azure app client ID | **Yes** — the CLI will fail fast if not set |
+| `MS_TODO_CLIENT_ID` | Azure app client ID | Required for login and Graph operations, not cached account/status/profile listing or logout |
+| `MS_TODO_PROFILE` | Account profile when `--profile` is omitted; otherwise `default` | No |
 
 Set your client ID before using:
 
@@ -66,6 +68,62 @@ ms-todo-cli auth login
 ```
 
 Follow the device code instructions printed to stderr. After login, a success JSON is printed to stdout.
+
+### Multiple accounts / profiles
+
+Choose your own aliases when signing in:
+
+```bash
+ms-todo-cli auth login --profile personal
+ms-todo-cli auth login --profile work
+ms-todo-cli auth profiles
+```
+
+Aliases are 1–64 lowercase letters, digits, hyphens or underscores, starting with a
+letter or digit. Each profile is bound to the Microsoft account identity returned
+at login, rather than its email address or its position in the token cache.
+Its account metadata and MSAL cache are stored together in
+`~/.ms-todo-cli/profiles/<alias>.json`, atomically updated under a per-profile
+filesystem lock so concurrent CLI processes do not overwrite token refreshes.
+Signing into a different account under an existing alias requires explicit consent:
+
+```bash
+ms-todo-cli auth login --profile work --replace
+```
+
+Every command, including authentication, attachments, steps, groups and the
+top-level shortcuts, accepts `--profile` before, between or after subcommands:
+
+```bash
+ms-todo-cli --profile work task list --all-lists
+ms-todo-cli task --profile personal create --title "Buy milk"
+ms-todo-cli create --title "Review proposal" --profile work
+```
+
+Selection precedence is **`--profile` → `MS_TODO_PROFILE` → `default`**.
+There is no mutable active account. An unknown or expired profile never falls back
+to another account, and task JSON read from stdin cannot change the profile.
+Task and list response structures remain unchanged.
+
+Authentication status reports whether the selected profile has a cached account;
+it includes `tokenVerified: false` and does not verify that its token is usable.
+`auth profiles` returns aliases and cached account details without token data.
+Normal Graph commands refresh tokens
+silently when possible and return a profile-specific reauthentication error when
+interactive login is needed. Only `auth login` starts device-code authentication.
+Logout removes authentication only for the selected profile:
+
+```bash
+ms-todo-cli auth status --profile work
+ms-todo-cli auth print-account --profile work
+ms-todo-cli auth logout --profile work
+```
+
+Existing single-account installations retain the `default` profile. The legacy
+`~/.ms-todo-cli/msal-cache.json` cache is migrated safely when unambiguous; a cache
+containing multiple accounts is rejected rather than choosing the first account.
+All profiles share `MS_TODO_CLIENT_ID` and the existing Microsoft Graph permissions.
+Profile credentials are local sensitive files: do not commit or share them.
 
 ### Check status
 
@@ -261,6 +319,21 @@ Error responses have `ok: false` and exit with code 1:
 ## OpenClaw / Scripting Integration
 
 The JSON output is designed for easy parsing:
+
+Set `MS_TODO_CLIENT_ID` and optionally `MS_TODO_PROFILE` in the OpenClaw process
+environment. Complete device-code login once for each alias using the same OS user
+and home directory as OpenClaw (or its persistent container home). Subsequent calls
+use cached credentials without prompting. Keep the authentication directory on a
+private persistent volume if the environment is recreated.
+
+For concurrent jobs, pass the profile explicitly on each invocation, or set it
+only in that job's environment; do not modify a shared active-account setting.
+
+```bash
+MS_TODO_PROFILE=work ms-todo-cli task list --all-lists
+ms-todo-cli task search --query "meeting" --profile work
+echo '{"title":"Buy eggs","list":"Shopping"}' | ms-todo-cli create --stdin --profile personal
+```
 
 ```bash
 # Get all lists and parse with jq

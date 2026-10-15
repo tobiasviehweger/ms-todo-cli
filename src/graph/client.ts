@@ -1,5 +1,6 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
-import { getAccessToken } from '../auth/authManager';
+import { getAccessToken as acquireAccessToken } from '../auth/authManager';
+import { getProfile, withProfile } from '../profile';
 import { ErrorCodes, AppError } from '../errors';
 import { sanitizeSearchTerm } from '../utils/search';
 import { TodoTask, TodoList, ChecklistItem, TaskAttachment, TodoListGroup } from '../schema/types';
@@ -10,9 +11,10 @@ const BETA_BASE_URL = 'https://graph.microsoft.com/beta';
 const TASK_FETCH_BATCH_SIZE = 3;
 
 function createGraphClient(baseURL: string): AxiosInstance {
+  const profile = getProfile();
   const client = axios.create({ baseURL });
   client.interceptors.request.use(async (config) => {
-    const token = await getAccessToken();
+    const token = await withProfile(profile, () => acquireAccessToken());
     config.headers = config.headers || {};
     config.headers['Authorization'] = `Bearer ${token}`;
     config.headers['Content-Type'] = 'application/json';
@@ -21,9 +23,12 @@ function createGraphClient(baseURL: string): AxiosInstance {
   client.interceptors.response.use(
     (res) => res,
     (err) => {
+      if (err instanceof AppError) throw err;
       const status = err.response?.status;
       if (status === 429) throw new AppError(ErrorCodes.RATE_LIMITED, 'Rate limited by Microsoft Graph API');
-      if (status === 401 || status === 403) throw new AppError(ErrorCodes.AUTH_EXPIRED, 'Authentication expired or invalid');
+      if (status === 401 || status === 403) {
+        throw new AppError(ErrorCodes.AUTH_EXPIRED, `Authentication expired or invalid for profile "${profile}". Run: ms-todo-cli auth login --profile ${profile}`);
+      }
       if (status === 404) {
         const url = normalizeGraphUrl(err.config?.url || '', baseURL);
         throw mapNotFoundError(url);
@@ -385,6 +390,8 @@ export async function uploadAttachment(
   taskId: string,
   attachment: { name: string; contentBytes: string; contentType?: string },
 ): Promise<TaskAttachment> {
+  const profile = getProfile();
+  const getAccessToken = () => withProfile(profile, () => acquireAccessToken());
   const betaClient = createBetaClient();
   const contentBytes = Buffer.from(attachment.contentBytes, 'base64');
   const fileSize = contentBytes.length;
