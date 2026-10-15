@@ -467,7 +467,7 @@ export async function uploadAttachment(
         'Content-Type': 'application/octet-stream',
         'Content-Range': `bytes ${offset}-${chunkEnd - 1}/${fileSize}`,
       },
-      body: chunk as unknown as BodyInit,
+      body: chunk,
     });
     if (!uploadRes.ok) {
       const errorBody = await uploadRes.text();
