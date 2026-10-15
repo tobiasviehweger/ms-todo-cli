@@ -1,137 +1,90 @@
-import axios, { AxiosInstance } from 'axios';
-
 import { createListGroup, getListGroups, getLists, searchTasks, updateListGroup } from '../src/graph/client';
 
-jest.mock('axios');
 jest.mock('../src/auth/authManager', () => ({
   getAccessToken: jest.fn().mockResolvedValue('token'),
 }));
 
-const mockAxios = axios as jest.Mocked<typeof axios>;
-const mockGet = jest.fn();
-const mockPost = jest.fn();
-const mockPatch = jest.fn();
+const mockFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
 
-const mockClient = {
-  get: mockGet,
-  post: mockPost,
-  patch: mockPatch,
-  interceptors: {
-    request: { use: jest.fn() },
-    response: { use: jest.fn() },
-  },
-} as unknown as AxiosInstance;
+function jsonResponse(data: unknown): Response {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    text: async () => JSON.stringify(data),
+  } as Response;
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockAxios.create.mockReturnValue(mockClient);
+  global.fetch = mockFetch;
 });
 
 describe('searchTasks', () => {
   test('normalizes search terms before building filter params', async () => {
-    mockGet.mockResolvedValueOnce({ data: { value: [{ id: 'list-1', displayName: 'Inbox' }] } });
-    mockGet.mockResolvedValueOnce({ data: { value: [] } });
+    mockFetch.mockResolvedValueOnce(jsonResponse({ value: [{ id: 'list-1', displayName: 'Inbox' }] }));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ value: [] }));
 
     await searchTasks('  FoO!!!   bar  ');
 
-    const [, requestConfig] = mockGet.mock.calls[1];
-    const params = requestConfig?.params as Record<string, string>;
-
-    expect(params['@term']).toBe("'foo bar'");
-    expect(params.$filter).toContain('@term');
+    const url = new URL(String(mockFetch.mock.calls[1][0]));
+    expect(url.searchParams.get('@term')).toBe("'foo bar'");
+    expect(url.searchParams.get('$filter')).toContain('@term');
   });
 
   test('handles search terms that normalize to an empty string', async () => {
     await expect(searchTasks('  !!!   ???  ')).resolves.toEqual([]);
-    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   test('handles whitespace-only search terms', async () => {
     await expect(searchTasks('     ')).resolves.toEqual([]);
-    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   test('preserves and normalizes unicode search terms consistently', async () => {
-    mockGet.mockResolvedValueOnce({ data: { value: [{ id: 'list-1', displayName: 'Inbox' }] } });
-    mockGet.mockResolvedValueOnce({ data: { value: [] } });
+    mockFetch.mockResolvedValueOnce(jsonResponse({ value: [{ id: 'list-1', displayName: 'Inbox' }] }));
+    mockFetch.mockResolvedValueOnce(jsonResponse({ value: [] }));
 
     await searchTasks('  Café   résumé  ');
 
-    const [, requestConfig] = mockGet.mock.calls[1];
-    const params = requestConfig?.params as Record<string, string>;
-
-    expect(params['@term']).toBe("'café résumé'");
-    expect(params.$filter).toContain('@term');
+    expect(new URL(String(mockFetch.mock.calls[1][0])).searchParams.get('@term')).toBe("'café résumé'");
   });
 });
 
-describe('getLists', () => {
-  test('uses provided client when available', async () => {
-    const providedClient = {
-      get: jest.fn().mockResolvedValue({ data: { value: [{ id: 'list-42', displayName: 'Provided' }] } }),
-      interceptors: {
-        request: { use: jest.fn() },
-        response: { use: jest.fn() },
-      },
-    } as unknown as AxiosInstance;
+describe('Graph requests', () => {
+  test('uses fetch to get lists from the v1.0 Graph endpoint', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ value: [{ id: 'list-1', displayName: 'Inbox' }] }));
 
-    const lists = await getLists(providedClient);
-
-    expect(lists).toEqual([{ id: 'list-42', displayName: 'Provided' }]);
-    expect(providedClient.get).toHaveBeenCalledWith('/me/todo/lists');
-    expect(mockAxios.create).not.toHaveBeenCalled();
+    await expect(getLists()).resolves.toEqual([{ id: 'list-1', displayName: 'Inbox' }]);
+    expect(String(mockFetch.mock.calls[0][0])).toBe('https://graph.microsoft.com/v1.0/me/todo/lists');
+    const headers = mockFetch.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(headers['Content-Type']).toBe('application/json');
   });
 
-  test('creates a new client when none is provided', async () => {
-    mockGet.mockResolvedValueOnce({ data: { value: [{ id: 'list-1', displayName: 'Inbox' }] } });
-
-    const lists = await getLists();
-
-    expect(mockAxios.create).toHaveBeenCalledTimes(1);
-    expect(mockGet).toHaveBeenCalledWith('/me/todo/lists');
-    expect(lists).toEqual([{ id: 'list-1', displayName: 'Inbox' }]);
-  });
-});
-
-describe('list groups', () => {
-  test('maps beta task groups name to displayName', async () => {
-    mockGet.mockResolvedValueOnce({
-      data: {
-        value: [
-          { id: 'group-1', name: 'Work', isDefaultGroup: false, groupKey: 'k1', changeKey: 'c1' },
-        ],
-      },
-    });
-
+  test('maps beta task group fields and serializes JSON mutation bodies', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({
+      value: [{ id: 'group-1', name: 'Work', isDefaultGroup: false, groupKey: 'k1', changeKey: 'c1' }],
+    }));
     await expect(getListGroups()).resolves.toEqual([{ id: 'group-1', displayName: 'Work' }]);
-    expect(mockGet).toHaveBeenCalledWith('/me/outlook/taskGroups');
-  });
+    expect(String(mockFetch.mock.calls[0][0])).toBe('https://graph.microsoft.com/beta/me/outlook/taskGroups');
 
-  test('returns an empty list when beta task groups response has no value array', async () => {
-    mockGet.mockResolvedValueOnce({ data: {} });
-
-    await expect(getListGroups()).resolves.toEqual([]);
-  });
-
-  test('creates a beta task group from the returned name field', async () => {
-    mockPost.mockResolvedValueOnce({
-      data: { id: 'group-2', name: 'Personal', isDefaultGroup: false, groupKey: 'k2', changeKey: 'c2' },
-    });
-
+    mockFetch.mockResolvedValueOnce(jsonResponse({
+      id: 'group-2', name: 'Personal', isDefaultGroup: false, groupKey: 'k2', changeKey: 'c2',
+    }));
     await expect(createListGroup('Personal')).resolves.toEqual({ id: 'group-2', displayName: 'Personal' });
-    expect(mockAxios.create).toHaveBeenCalledTimes(1);
-    expect(mockPost).toHaveBeenCalledWith('/me/outlook/taskGroups', { name: 'Personal' });
-  });
+    expect(mockFetch.mock.calls[1][1]?.method).toBe('POST');
+    expect(mockFetch.mock.calls[1][1]?.body).toBe(JSON.stringify({ name: 'Personal' }));
 
-  test('handles update responses that do not include a body', async () => {
-    mockPatch.mockResolvedValueOnce({
-      data: { id: 'group-3', name: 'Renamed', isDefaultGroup: false, groupKey: 'k3', changeKey: 'c3' },
-    });
-
+    mockFetch.mockResolvedValueOnce(jsonResponse({
+      id: 'group-3', name: 'Renamed', isDefaultGroup: false, groupKey: 'k3', changeKey: 'c3',
+    }));
     await expect(updateListGroup('group-3', { displayName: 'Renamed' })).resolves.toEqual({
       id: 'group-3',
       displayName: 'Renamed',
     });
-    expect(mockPatch).toHaveBeenCalledWith('/me/outlook/taskGroups/group-3', { name: 'Renamed' });
+    expect(mockFetch.mock.calls[2][1]?.method).toBe('PATCH');
+    expect(mockFetch.mock.calls[2][1]?.body).toBe(JSON.stringify({ name: 'Renamed' }));
   });
 });

@@ -1,41 +1,50 @@
-import axios, { AxiosInstance, InternalAxiosRequestConfig } from 'axios';
 import { getAccessToken } from '../src/auth/authManager';
-import { getLists, getListGroups, getTasksAcrossLists, searchTasks, uploadAttachment } from '../src/graph/client';
+import { deleteTask, getLists, getListGroups, getTasks, getTasksAcrossLists, searchTasks, uploadAttachment } from '../src/graph/client';
 import { getProfile, withProfile } from '../src/profile';
-import { AppError, ErrorCodes } from '../src/errors';
+import { ErrorCodes } from '../src/errors';
 
-jest.mock('axios');
 jest.mock('../src/auth/authManager', () => ({ getAccessToken: jest.fn() }));
 
-const mockAxios = jest.mocked(axios);
+const mockFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
 const mockToken = jest.mocked(getAccessToken);
-let requests: Array<{ profile: string; url: string }>;
+let requests: Array<{ profile: string; url: string; token: string }>;
+
+function jsonResponse(data: unknown, status = 200, headers = new Headers()): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? 'OK' : '',
+    headers,
+    text: async () => data === undefined ? '' : JSON.stringify(data),
+  } as Response;
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
   requests = [];
-  mockToken.mockImplementation(async () => `token-${getProfile()}`);
-  mockAxios.create.mockImplementation(() => {
-    let interceptor: (config: InternalAxiosRequestConfig) => Promise<InternalAxiosRequestConfig>;
-    const request = async (url: string) => {
-      const config = await interceptor({ headers: {} } as InternalAxiosRequestConfig);
-      requests.push({ profile: String(config.headers.Authorization).split(' ').pop()!, url });
-      if (url.endsWith('createUploadSession')) {
-        return { data: { uploadUrl: 'https://graph.microsoft.com/upload' } };
-      }
-      if (url === '/me/todo/lists') {
-        return { data: { value: [{ id: 'list', displayName: 'Tasks' }] } };
-      }
-      return { data: { value: [] } };
-    };
-    return {
-      get: jest.fn(request),
-      post: jest.fn(request),
-      interceptors: {
-        request: { use: jest.fn((handler) => { interceptor = handler; }) },
-        response: { use: jest.fn() },
-      },
-    } as unknown as AxiosInstance;
+  global.fetch = mockFetch;
+  mockToken.mockImplementation(async () => {
+    await Promise.resolve();
+    return `token-${getProfile()}`;
+  });
+  mockFetch.mockImplementation(async (input, init) => {
+    const url = String(input);
+    const headers = init?.headers as Record<string, string>;
+    requests.push({
+      profile: getProfile(),
+      url,
+      token: headers.Authorization.split(' ').pop()!,
+    });
+    if (url.endsWith('createUploadSession')) {
+      return jsonResponse({ uploadUrl: 'https://graph.microsoft.com/upload' });
+    }
+    if (url === 'https://graph.microsoft.com/v1.0/me/todo/lists') {
+      return jsonResponse({ value: [{ id: 'list', displayName: 'Tasks' }] });
+    }
+    if (url === 'https://graph.microsoft.com/beta/me/outlook/taskGroups') {
+      return jsonResponse({ value: [] });
+    }
+    return jsonResponse({ value: [] });
   });
 });
 
@@ -45,34 +54,48 @@ test('parallel v1 and beta operations use only their selected accounts', async (
     withProfile('personal', () => getListGroups()),
     withProfile('work', () => searchTasks('review')),
   ]);
-  expect(requests.filter((r) => r.url.includes('taskGroups'))[0].profile).toBe('token-personal');
-  expect(requests.filter((r) => !r.url.includes('taskGroups')).every((r) => r.profile === 'token-work')).toBe(true);
+  expect(requests.filter((request) => request.url.includes('taskGroups'))[0].token).toBe('token-personal');
+  expect(requests.filter((request) => !request.url.includes('taskGroups')).every(
+    (request) => request.token === 'token-work',
+  )).toBe(true);
 });
 
 test('attachment session and each upload request use the selected account', async () => {
-  mockAxios.put.mockImplementation(async (_url, _body, config) => {
-    expect(String(config?.headers?.Authorization).split(' ').pop()).toBe('token-work');
+  mockFetch.mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url.endsWith('createUploadSession')) {
+      requests.push({ profile: getProfile(), url, token: '' });
+      return jsonResponse({ uploadUrl: 'https://graph.microsoft.com/upload' });
+    }
+    const headers = init?.headers as Record<string, string>;
+    expect(headers.Authorization.split(' ').pop()).toBe('token-work');
     expect(getProfile()).toBe('work');
-    return { status: 201, headers: { location: '/attachments/id' }, data: {} };
+    requests.push({ profile: getProfile(), url, token: headers.Authorization.split(' ').pop()! });
+    return jsonResponse(undefined, 201, new Headers({ location: '/attachments/id' }));
   });
   await withProfile('work', () => uploadAttachment('list', 'task', {
     name: 'note.txt',
     contentBytes: Buffer.from('notes').toString('base64'),
   }));
-  expect(requests).toEqual([{
-    profile: 'token-work',
-    url: '/me/todo/lists/list/tasks/task/attachments/createUploadSession',
-  }]);
-  expect(mockAxios.put).toHaveBeenCalledTimes(1);
+  expect(requests).toEqual([
+    {
+      profile: 'work',
+      url: 'https://graph.microsoft.com/beta/me/todo/lists/list/tasks/task/attachments/createUploadSession',
+      token: '',
+    },
+    { profile: 'work', url: 'https://graph.microsoft.com/upload/content', token: 'token-work' },
+  ]);
+  expect(mockFetch.mock.calls[1][1]?.headers).toMatchObject({
+    'Content-Type': 'application/octet-stream',
+    'Content-Range': 'bytes 0-4/5',
+  });
 });
 
-test('an interceptor retains its profile even if called outside the originating context', async () => {
-  await withProfile('work', () => getLists());
-  const client = mockAxios.create.mock.results[0].value as AxiosInstance;
-  const use = client.interceptors.request.use as jest.Mock;
-  const interceptor = use.mock.calls[0][0];
-  const config = await withProfile('personal', () => interceptor({ headers: {} }));
-  expect(String(config.headers.Authorization).split(' ').pop()).toBe('token-work');
+test('a Graph client retains its profile when its request starts outside that context', async () => {
+  const request = withProfile('work', () => getLists());
+  await withProfile('personal', () => request);
+  expect(requests[0].profile).toBe('work');
+  expect(requests[0].token).toBe('token-work');
 });
 
 test('failed authentication never retries under another profile', async () => {
@@ -85,39 +108,43 @@ test('failed authentication never retries under another profile', async () => {
   expect(requests).toEqual([]);
 });
 
-test('Graph response interceptors preserve profile-specific authentication errors', async () => {
-  await withProfile('work', () => getLists());
-  const client = mockAxios.create.mock.results[0].value as AxiosInstance;
-  const interceptor = (client.interceptors.response.use as jest.Mock).mock.calls[0][1];
-  const error = new AppError(ErrorCodes.AUTH_REQUIRED, 'Profile work requires login');
-  expect(() => interceptor(error)).toThrow(error);
-  expect(() => interceptor({ response: { status: 401 } })).toThrow('auth login --profile work');
+test('maps Graph authentication and missing-resource errors', async () => {
+  mockFetch.mockResolvedValueOnce(jsonResponse({ error: { message: 'unauthorized' } }, 401));
+  await expect(withProfile('work', () => getLists())).rejects.toMatchObject({
+    code: ErrorCodes.AUTH_EXPIRED,
+    message: expect.stringContaining('auth login --profile work'),
+  });
+
+  mockFetch.mockResolvedValueOnce(jsonResponse({ error: { message: 'not found' } }, 404));
+  await expect(withProfile('work', () => getTasks('list'))).rejects.toMatchObject({
+    code: ErrorCodes.LIST_NOT_FOUND,
+  });
+});
+
+test('handles empty 204 responses for delete requests', async () => {
+  mockFetch.mockResolvedValueOnce(jsonResponse(undefined, 204));
+  await expect(withProfile('work', () => deleteTask('list', 'task'))).resolves.toBeUndefined();
 });
 
 test('pagination and concurrent cross-list requests retain their profile', async () => {
   const pages: Record<string, object> = {
-    '/me/todo/lists': { value: [{ id: 'one', displayName: 'One' }], '@odata.nextLink': '/lists-page-two' },
+    '/me/todo/lists': { value: [{ id: 'one', displayName: 'One' }], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/lists-page-two' },
     '/lists-page-two': { value: [{ id: 'two', displayName: 'Two' }] },
-    '/me/todo/lists/one/tasks': { value: [], '@odata.nextLink': '/tasks-page-two' },
+    '/me/todo/lists/one/tasks': { value: [], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/tasks-page-two' },
     '/tasks-page-two': { value: [] },
     '/me/todo/lists/two/tasks': { value: [] },
   };
-  mockAxios.create.mockImplementationOnce(() => {
-    let interceptor: (config: InternalAxiosRequestConfig) => Promise<InternalAxiosRequestConfig>;
-    return {
-      get: jest.fn(async (url: string) => {
-        await Promise.resolve();
-        const config = await interceptor({ headers: {} } as InternalAxiosRequestConfig);
-        requests.push({ profile: String(config.headers.Authorization).split(' ').pop()!, url });
-        return { data: pages[url] };
-      }),
-      interceptors: {
-        request: { use: jest.fn((handler) => { interceptor = handler; }) },
-        response: { use: jest.fn() },
-      },
-    } as unknown as AxiosInstance;
+  mockFetch.mockImplementation(async (input, init) => {
+    const url = String(input);
+    const headers = init?.headers as Record<string, string>;
+    requests.push({
+      profile: getProfile(),
+      url,
+      token: headers.Authorization.split(' ').pop()!,
+    });
+    return jsonResponse(pages[new URL(url).pathname] || { value: [] });
   });
   await withProfile('work', () => getTasksAcrossLists());
   expect(requests).toHaveLength(5);
-  expect(requests.every((request) => request.profile === 'token-work')).toBe(true);
+  expect(requests.every((request) => request.token === 'token-work')).toBe(true);
 });

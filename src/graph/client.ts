@@ -1,4 +1,3 @@
-import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import { getAccessToken as acquireAccessToken } from '../auth/authManager';
 import { getProfile, withProfile } from '../profile';
 import { ErrorCodes, AppError } from '../errors';
@@ -10,33 +9,70 @@ const BETA_BASE_URL = 'https://graph.microsoft.com/beta';
 // Small batch size balances latency while reducing Graph API throttling risk.
 const TASK_FETCH_BATCH_SIZE = 3;
 
-function createGraphClient(baseURL: string): AxiosInstance {
+interface GraphResponse<T> {
+  data: T;
+  status: number;
+  headers: Headers;
+}
+
+interface GraphClient {
+  get<T = any>(url: string, config?: { params?: Record<string, string> }): Promise<GraphResponse<T>>;
+  post<T = any>(url: string, data?: unknown): Promise<GraphResponse<T>>;
+  patch<T = any>(url: string, data?: unknown): Promise<GraphResponse<T>>;
+  delete<T = any>(url: string): Promise<GraphResponse<T>>;
+}
+
+function createGraphClient(baseURL: string): GraphClient {
   const profile = getProfile();
-  const client = axios.create({ baseURL });
-  client.interceptors.request.use(async (config) => {
+  const request = async <T>(
+    method: string,
+    rawUrl: string,
+    body?: unknown,
+    params?: Record<string, string>,
+  ): Promise<GraphResponse<T>> => {
     const token = await withProfile(profile, () => acquireAccessToken());
-    config.headers = config.headers || {};
-    config.headers['Authorization'] = `Bearer ${token}`;
-    config.headers['Content-Type'] = 'application/json';
-    return config;
-  });
-  client.interceptors.response.use(
-    (res) => res,
-    (err) => {
-      if (err instanceof AppError) throw err;
-      const status = err.response?.status;
-      if (status === 429) throw new AppError(ErrorCodes.RATE_LIMITED, 'Rate limited by Microsoft Graph API');
-      if (status === 401 || status === 403) {
+    const url = new URL(rawUrl, baseURL);
+    if (params) {
+      for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    }
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          Authorization: ['Bearer', token].join(' '),
+          'Content-Type': 'application/json',
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (err) {
+      throw new AppError(ErrorCodes.GRAPH_ERROR, err instanceof Error ? err.message : String(err));
+    }
+    const text = response.status === 204 ? '' : await response.text();
+    let data: any;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = text;
+      }
+    }
+    if (!response.ok) {
+      if (response.status === 429) throw new AppError(ErrorCodes.RATE_LIMITED, 'Rate limited by Microsoft Graph API');
+      if (response.status === 401 || response.status === 403) {
         throw new AppError(ErrorCodes.AUTH_EXPIRED, `Authentication expired or invalid for profile "${profile}". Run: ms-todo-cli auth login --profile ${profile}`);
       }
-      if (status === 404) {
-        const url = normalizeGraphUrl(err.config?.url || '', baseURL);
-        throw mapNotFoundError(url);
-      }
-      throw new AppError(ErrorCodes.GRAPH_ERROR, err.response?.data?.error?.message || err.message);
+      if (response.status === 404) throw mapNotFoundError(normalizeGraphUrl(rawUrl, baseURL));
+      throw new AppError(ErrorCodes.GRAPH_ERROR, data?.error?.message || response.statusText || `HTTP ${response.status}`);
     }
-  );
-  return client;
+    return { data, status: response.status, headers: response.headers };
+  };
+  return {
+    get: <T>(url: string, config?: { params?: Record<string, string> }) => request<T>('GET', url, undefined, config?.params),
+    post: <T>(url: string, data?: unknown) => request<T>('POST', url, data),
+    patch: <T>(url: string, data?: unknown) => request<T>('PATCH', url, data),
+    delete: <T>(url: string) => request<T>('DELETE', url),
+  };
 }
 
 function normalizeGraphUrl(rawUrl: string, baseUrl: string = BASE_URL): string {
@@ -60,11 +96,11 @@ function mapNotFoundError(url: string): AppError {
   return new AppError(ErrorCodes.TASK_NOT_FOUND, 'Resource not found');
 }
 
-function createBetaClient(): AxiosInstance {
+function createBetaClient(): GraphClient {
   return createGraphClient(BETA_BASE_URL);
 }
 
-function createClient(): AxiosInstance {
+function createClient(): GraphClient {
   return createGraphClient(BASE_URL);
 }
 
@@ -127,14 +163,14 @@ async function mapConcurrent<TInput, TOutput>(
 }
 
 async function fetchPaged<TInput, TOutput>(
-  client: AxiosInstance,
+  client: GraphClient,
   url: string,
   mapItem: PageItemMapper<TInput, TOutput>,
 ): Promise<TOutput[]> {
   const results: TOutput[] = [];
   let nextUrl: string | undefined = url;
   while (nextUrl) {
-    const res: AxiosResponse<ODataPage<TInput>> = await client.get(nextUrl);
+    const res = await client.get<ODataPage<TInput>>(nextUrl);
     for (const item of res.data.value || []) {
       results.push(mapItem(item));
     }
@@ -157,7 +193,7 @@ function buildTaskSearchParams(term: string): Record<string, string> {
 }
 
 async function fetchSearchTasksForList(
-  client: AxiosInstance,
+  client: GraphClient,
   list: TodoList,
   params: Record<string, string>,
 ): Promise<TodoTask[]> {
@@ -166,7 +202,7 @@ async function fetchSearchTasksForList(
   let isFirstRequest = true;
 
   while (nextUrl) {
-    const res: AxiosResponse<ODataPage<GraphTask>> = await client.get(
+    const res = await client.get<ODataPage<GraphTask>>(
       nextUrl,
       isFirstRequest ? { params } : undefined,
     );
@@ -221,7 +257,7 @@ export async function deleteListGroup(listGroupId: string): Promise<void> {
   await client.delete(`/me/outlook/taskGroups/${listGroupId}`);
 }
 
-export async function getLists(client?: AxiosInstance): Promise<TodoList[]> {
+export async function getLists(client?: GraphClient): Promise<TodoList[]> {
   const activeClient = client ?? createClient();
   const res = await activeClient.get('/me/todo/lists');
   return res.data.value;
@@ -269,7 +305,7 @@ export async function searchTasks(keyword: string): Promise<TodoTask[]> {
 
 /** Internal helper: fetch a single task without calling getLists(). */
 async function fetchTaskRaw(
-  client: AxiosInstance,
+  client: GraphClient,
   listId: string,
   taskId: string,
   listName?: string,
@@ -416,21 +452,29 @@ export async function uploadAttachment(
     const chunkEnd = Math.min(offset + CHUNK_SIZE, fileSize);
     const chunk = contentBytes.slice(offset, chunkEnd);
 
-    const uploadRes = await axios.put(
-      `${uploadUrl}/content`,
-      chunk,
-      {
-        headers: {
-          Authorization: `Bearer ${await getAccessToken()}`,
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': chunk.length,
-          'Content-Range': `bytes ${offset}-${chunkEnd - 1}/${fileSize}`,
-        },
+    const uploadRes = await fetch(`${uploadUrl}/content`, {
+      method: 'PUT',
+      headers: {
+        Authorization: ['Bearer', await getAccessToken()].join(' '),
+        'Content-Type': 'application/octet-stream',
+        'Content-Range': `bytes ${offset}-${chunkEnd - 1}/${fileSize}`,
+      },
+      body: chunk as unknown as BodyInit,
+    });
+    if (!uploadRes.ok) {
+      const errorBody = await uploadRes.text();
+      let message: string | undefined;
+      try {
+        message = JSON.parse(errorBody)?.error?.message;
+      } catch {
+        message = undefined;
       }
-    );
+      throw new AppError(ErrorCodes.GRAPH_ERROR, message || uploadRes.statusText || `HTTP ${uploadRes.status}`);
+    }
 
-    if (uploadRes.status === 201 && uploadRes.headers.location) {
-      const attachmentId = uploadRes.headers.location.split('/').pop();
+    const location = uploadRes.headers.get('location');
+    if (uploadRes.status === 201 && location) {
+      const attachmentId = location.split('/').pop();
       return {
         id: attachmentId || '',
         name: attachment.name,
