@@ -235,12 +235,19 @@ export async function getAccessToken(): Promise<string> {
     const data = await loadData(profile);
     if (!data) throw authError(profile, 'Not authenticated');
     const pca = createPca();
-    pca.getTokenCache().deserialize(data.cache);
-    const accounts = await pca.getTokenCache().getAllAccounts();
-    const matches = accounts.filter(account => sameIdentity(accountMetadata(account), data.account));
-    if (matches.length !== 1 || accounts.length !== 1) throw authError(profile, 'Cached account does not match the profile identity');
+    let account: msal.AccountInfo;
     try {
-      const result = await pca.acquireTokenSilent({ account: matches[0], scopes: SCOPES });
+      pca.getTokenCache().deserialize(data.cache);
+      const accounts = await pca.getTokenCache().getAllAccounts();
+      const matches = accounts.filter(cached => sameIdentity(accountMetadata(cached), data.account));
+      if (matches.length !== 1 || accounts.length !== 1) throw authError(profile, 'Cached account does not match the profile identity');
+      account = matches[0];
+    } catch (err) {
+      if (err instanceof AppError) throw err;
+      throw authError(profile, 'Cached authentication is invalid; log out and sign in again');
+    }
+    try {
+      const result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
       if (!result?.accessToken || !result.account || !sameIdentity(accountMetadata(result.account), data.account)) {
         throw new Error('Token identity mismatch');
       }

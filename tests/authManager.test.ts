@@ -29,7 +29,7 @@ function read(profile = 'default'): { account: typeof alice; cache: string } {
 }
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(process.cwd(), '.auth-test-'));
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'ms-todo-cli-auth-test-'));
   jest.spyOn(os, 'homedir').mockReturnValue(home);
   previousClientId = process.env.MS_TODO_CLIENT_ID;
   process.env.MS_TODO_CLIENT_ID = 'test-client';
@@ -134,6 +134,20 @@ test('same-profile read/refresh/write transactions serialize without lost update
   await Promise.all(Array.from({ length: 8 }, () => getAccessToken()));
   expect(JSON.parse(read().cache).revision).toBe(8);
   expect(fs.existsSync(`${file()}.lock`)).toBe(false);
+});
+
+test('malformed embedded cache returns a profile-specific authentication hint without modifying storage', async () => {
+  await withProfile('work', () => login());
+  const data = read('work');
+  data.cache = '{malformed-msal-cache';
+  fs.writeFileSync(file('work'), JSON.stringify(data));
+  const original = fs.readFileSync(file('work'), 'utf8');
+  await expect(withProfile('work', () => getAccessToken())).rejects.toMatchObject({
+    code: 'AUTH_REQUIRED',
+    message: expect.stringContaining('--profile work auth login'),
+  });
+  expect(fs.readFileSync(file('work'), 'utf8')).toBe(original);
+  expect(fs.existsSync(`${file('work')}.lock`)).toBe(false);
 });
 
 test('logout queues after refresh and cannot be undone by its late write', async () => {
