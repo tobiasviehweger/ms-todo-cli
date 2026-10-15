@@ -2,9 +2,10 @@ import * as msal from '@azure/msal-node';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { randomUUID } from 'crypto';
+import { execFileSync } from 'child_process';
+import { createHash, randomUUID } from 'crypto';
 import { ErrorCodes, AppError } from '../errors';
-import { getProfile, resolveProfile } from '../profile';
+import { getPinnedAccountIdentity, getProfile, pinAccountIdentity, resolveProfile } from '../profile';
 
 const SCOPES = ['Tasks.ReadWrite', 'User.Read', 'offline_access'];
 
@@ -83,11 +84,36 @@ function alive(pid: number): boolean {
   }
 }
 
+function processIncarnation(pid: number): string | undefined {
+  try {
+    let identity: string | undefined;
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const commandEnd = stat.lastIndexOf(')');
+      const fields = stat.slice(commandEnd + 2).split(' ');
+      const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      identity = `${bootId}:${fields[19]}`;
+    } else if (process.platform === 'darwin') {
+      identity = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+    } else if (process.platform === 'win32') {
+      identity = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`,
+      ], { encoding: 'utf8', timeout: 5000, windowsHide: true }).trim() || undefined;
+    }
+    return identity ? createHash('sha256').update(identity).digest('hex') : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function locked<T>(profile: string, operation: () => Promise<T>): Promise<T> {
   privateDir(configDir());
   privateDir(profilesDir());
   const directory = `${profileFile(profile)}.lock`;
-  const owner = `${process.pid}-${randomUUID()}`;
+  const owner = `${process.pid}-${processIncarnation(process.pid) || 'unknown'}-${randomUUID()}`;
   const candidate = `${directory}.${owner}.candidate`;
   fs.mkdirSync(candidate, { mode: 0o700 });
   const started = Date.now();
@@ -106,9 +132,14 @@ async function locked<T>(profile: string, operation: () => Promise<T>): Promise<
             throw authError(profile, 'Invalid authentication lock');
           }
           const owners = fs.readdirSync(directory);
-          if (owners.length === 1 && /^\d+-[a-f0-9-]+$/.test(owners[0])) {
-            const pid = Number(owners[0].split('-')[0]);
-            if (!alive(pid)) {
+          if (owners.length === 1) {
+            const ownerMatch = /^(\d+)-([a-f0-9]{64}|unknown)-[a-f0-9-]+$/.exec(owners[0]);
+            const legacyOwnerMatch = /^(\d+)-[a-f0-9-]+$/.exec(owners[0]);
+            const pid = Number(ownerMatch?.[1] || legacyOwnerMatch?.[1]);
+            const incarnation = ownerMatch?.[2];
+            const currentIncarnation = incarnation && incarnation !== 'unknown' ? processIncarnation(pid) : undefined;
+            if ((ownerMatch || legacyOwnerMatch) && (!alive(pid)
+              || (currentIncarnation !== undefined && currentIncarnation !== incarnation))) {
               // Only the contender that removes this unique owner may remove the directory.
               fs.unlinkSync(path.join(directory, owners[0]));
               try {
@@ -154,7 +185,10 @@ function accountMetadata(account: msal.AccountInfo): CachedAccount {
   };
 }
 
-function sameIdentity(a: CachedAccount, b: CachedAccount): boolean {
+function sameIdentity(
+  a: Pick<CachedAccount, 'homeAccountId' | 'environment' | 'tenantId'>,
+  b: Pick<CachedAccount, 'homeAccountId' | 'environment' | 'tenantId'>,
+): boolean {
   return a.homeAccountId === b.homeAccountId
     && a.environment.toLowerCase() === b.environment.toLowerCase()
     && a.tenantId === b.tenantId;
@@ -193,17 +227,18 @@ async function loadData(profile: string): Promise<ProfileData | undefined> {
   const legacy = readPrivate(path.join(configDir(), 'msal-cache.json'));
   if (legacy === undefined) return undefined;
   const pca = createPca(process.env.MS_TODO_CLIENT_ID || '00000000-0000-0000-0000-000000000000');
+  let migrated: ProfileData;
   try {
     pca.getTokenCache().deserialize(legacy);
     const accounts = await pca.getTokenCache().getAllAccounts();
     if (accounts.length !== 1) throw new Error('Ambiguous legacy accounts');
-    const migrated: ProfileData = { version: 1, account: accountMetadata(accounts[0]), cache: legacy };
-    atomicWrite(profileFile(profile), JSON.stringify(migrated));
-    fs.unlinkSync(path.join(configDir(), 'msal-cache.json'));
-    return migrated;
+    migrated = { version: 1, account: accountMetadata(accounts[0]), cache: legacy };
   } catch {
     throw authError(profile, 'Legacy authentication is ambiguous or invalid; log out and sign in again');
   }
+  atomicWrite(profileFile(profile), JSON.stringify(migrated));
+  fs.unlinkSync(path.join(configDir(), 'msal-cache.json'));
+  return migrated;
 }
 
 export async function login(options: { replace?: boolean } = {}): Promise<void> {
@@ -234,6 +269,11 @@ export async function getAccessToken(): Promise<string> {
   return locked(profile, async () => {
     const data = await loadData(profile);
     if (!data) throw authError(profile, 'Not authenticated');
+    const pinnedIdentity = getPinnedAccountIdentity();
+    if (pinnedIdentity && !sameIdentity(pinnedIdentity, data.account)) {
+      throw new AppError(ErrorCodes.AUTH_REQUIRED, `Profile "${profile}": account binding changed during this command; retry the command`);
+    }
+    pinAccountIdentity(data.account);
     const pca = createPca();
     let account: msal.AccountInfo;
     try {
@@ -246,16 +286,17 @@ export async function getAccessToken(): Promise<string> {
       if (err instanceof AppError) throw err;
       throw authError(profile, 'Cached authentication is invalid; log out and sign in again');
     }
+    let result: msal.AuthenticationResult | null;
     try {
-      const result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
+      result = await pca.acquireTokenSilent({ account, scopes: SCOPES });
       if (!result?.accessToken || !result.account || !sameIdentity(accountMetadata(result.account), data.account)) {
         throw new Error('Token identity mismatch');
       }
-      atomicWrite(profileFile(profile), JSON.stringify({ ...data, cache: pca.getTokenCache().serialize() }));
-      return result.accessToken;
     } catch {
       throw new AppError(ErrorCodes.AUTH_EXPIRED, `Profile "${profile}": token refresh failed. Run: ms-todo-cli --profile ${profile} auth login`);
     }
+    atomicWrite(profileFile(profile), JSON.stringify({ ...data, cache: pca.getTokenCache().serialize() }));
+    return result.accessToken;
   });
 }
 

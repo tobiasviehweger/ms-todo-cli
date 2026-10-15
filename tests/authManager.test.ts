@@ -2,6 +2,7 @@ import fs from 'fs';
 import * as path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
+import { createHash } from 'crypto';
 import * as msal from '@azure/msal-node';
 import { login, logout, getAccessToken, getAccount, isAuthenticated, listProfiles } from '../src/auth/authManager';
 import { withProfile } from '../src/profile';
@@ -136,6 +137,20 @@ test('same-profile read/refresh/write transactions serialize without lost update
   expect(fs.existsSync(`${file()}.lock`)).toBe(false);
 });
 
+test('account identity remains pinned across requests in one profile invocation', async () => {
+  await withProfile('work', async () => {
+    await login();
+    await getAccessToken();
+    selected = bob;
+    await login({ replace: true });
+    await expect(getAccessToken()).rejects.toMatchObject({
+      code: 'AUTH_REQUIRED',
+      message: expect.stringContaining('account binding changed'),
+    });
+  });
+  expect((await withProfile('work', () => getAccount()))?.homeAccountId).toBe(bob.homeAccountId);
+});
+
 test('malformed embedded cache returns a profile-specific authentication hint without modifying storage', async () => {
   await withProfile('work', () => login());
   const data = read('work');
@@ -173,6 +188,7 @@ test('private permissions are repaired and atomic write failures preserve prior 
     return rename(source, destination);
   });
   await expect(login()).rejects.toThrow('Disk failed');
+  await expect(getAccessToken()).rejects.toThrow('Disk failed');
   expect(fs.readFileSync(file(), 'utf8')).toBe(original);
   expect(fs.readdirSync(path.dirname(file()))).toEqual(['default.json']);
 });
@@ -183,7 +199,11 @@ test('a dead process lock is reclaimed, a live process lock is respected', async
   fs.writeFileSync(path.join(`${file()}.lock`, '2147483647-abcdef'), '');
   expect(await getAccessToken()).toBe('test-access-token');
   fs.mkdirSync(`${file()}.lock`);
-  const owner = path.join(`${file()}.lock`, `${process.pid}-abcdef`);
+  const stat = process.platform === 'linux' ? fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8') : '';
+  const startTime = stat ? stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] : 'unknown';
+  const bootId = stat ? fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() : '';
+  const incarnation = stat ? createHash('sha256').update(`${bootId}:${startTime}`).digest('hex') : startTime;
+  const owner = path.join(`${file()}.lock`, `${process.pid}-${incarnation}-abcdef`);
   fs.writeFileSync(owner, '');
   const pending = getAccessToken();
   await new Promise(resolve => setTimeout(resolve, 40));
@@ -191,6 +211,16 @@ test('a dead process lock is reclaimed, a live process lock is respected', async
   fs.unlinkSync(owner);
   fs.rmdirSync(`${file()}.lock`);
   await expect(pending).resolves.toBe('test-access-token');
+});
+
+test('an abandoned lock from an earlier process incarnation is reclaimed', async () => {
+  if (process.platform !== 'linux') return;
+  await login();
+  fs.mkdirSync(`${file()}.lock`);
+  const previousIncarnation = createHash('sha256').update('previous incarnation').digest('hex');
+  fs.writeFileSync(path.join(`${file()}.lock`, `${process.pid}-${previousIncarnation}-abcdef`), '');
+  await expect(getAccessToken()).resolves.toBe('test-access-token');
+  expect(fs.existsSync(`${file()}.lock`)).toBe(false);
 });
 
 test('an orphaned empty lock from a crash during acquisition is recovered', async () => {
@@ -230,6 +260,36 @@ test('only unambiguous default legacy caches migrate, without a client ID', asyn
   expect(fs.existsSync(legacy)).toBe(true);
   await logout();
   expect(fs.existsSync(legacy)).toBe(false);
+});
+
+test('legacy migration persistence failures retain their storage error', async () => {
+  const root = path.join(home, '.ms-todo-cli');
+  fs.mkdirSync(root);
+  const legacy = path.join(root, 'msal-cache.json');
+  fs.writeFileSync(legacy, JSON.stringify({ accounts: [alice], revision: 3 }));
+  const rename = fs.renameSync;
+  jest.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+    if (source.toString().endsWith('.new')) throw new Error('Disk failed');
+    return rename(source, destination);
+  });
+  await expect(getAccount()).rejects.toThrow('Disk failed');
+  expect(fs.existsSync(legacy)).toBe(true);
+  expect(fs.existsSync(file())).toBe(false);
+});
+
+test('legacy cache removal failures retain their storage error', async () => {
+  const root = path.join(home, '.ms-todo-cli');
+  fs.mkdirSync(root);
+  const legacy = path.join(root, 'msal-cache.json');
+  fs.writeFileSync(legacy, JSON.stringify({ accounts: [alice], revision: 3 }));
+  const unlink = fs.unlinkSync;
+  jest.spyOn(fs, 'unlinkSync').mockImplementation(target => {
+    if (target.toString() === legacy) throw new Error('Removal failed');
+    return unlink(target);
+  });
+  await expect(getAccount()).rejects.toThrow('Removal failed');
+  expect(fs.existsSync(legacy)).toBe(true);
+  expect(fs.existsSync(file())).toBe(true);
 });
 
 test('malformed storage is not silently overwritten; unsafe aliases/files are ignored', async () => {
