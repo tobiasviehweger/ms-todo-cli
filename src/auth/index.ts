@@ -1,40 +1,40 @@
-import { login, getAccount, logout, isAuthenticated } from './authManager';
+import { login, getAccount, logout, listProfiles } from './authManager';
 import { printSuccess, printError } from '../output';
 import { ErrorCodes } from '../errors';
+import { getProfile } from '../profile';
 
-export async function handleAuthLogin(): Promise<void> {
+function reportError(err: unknown): void {
+  const e = err as { code?: string; message?: string };
+  const prefix = `Profile "${getProfile()}": `;
+  const message = e.message || 'Unknown error';
+  printError(e.code || ErrorCodes.GRAPH_ERROR, message.startsWith(prefix) ? message : prefix + message);
+}
+
+export async function handleAuthLogin(options?: { replace?: boolean }): Promise<void> {
   try {
-    await login();
+    await login(options);
     const account = await getAccount();
-    printSuccess({ message: 'Logged in successfully', account });
+    printSuccess({ profile: getProfile(), message: 'Logged in successfully', account });
   } catch (err: unknown) {
-    const e = err as { code?: string; message?: string };
-    printError(e.code || ErrorCodes.GRAPH_ERROR, e.message || 'Unknown error');
+    reportError(err);
   }
 }
 
 export async function handleAuthStatus(): Promise<void> {
   try {
-    const authenticated = await isAuthenticated();
-    if (authenticated) {
-      const account = await getAccount();
-      printSuccess({ authenticated: true, account });
-    } else {
-      printSuccess({ authenticated: false });
-    }
+    const account = await getAccount();
+    printSuccess({ profile: getProfile(), authenticated: account !== null, tokenVerified: false, status: account ? 'cached' : 'unauthenticated', ...(account ? { account } : {}) });
   } catch (err: unknown) {
-    const e = err as { code?: string; message?: string };
-    printError(e.code || ErrorCodes.GRAPH_ERROR, e.message || 'Unknown error');
+    reportError(err);
   }
 }
 
 export async function handleAuthLogout(): Promise<void> {
   try {
     await logout();
-    printSuccess({ message: 'Logged out successfully' });
+    printSuccess({ profile: getProfile(), message: 'Logged out successfully' });
   } catch (err: unknown) {
-    const e = err as { code?: string; message?: string };
-    printError(e.code || ErrorCodes.GRAPH_ERROR, e.message || 'Unknown error');
+    reportError(err);
   }
 }
 
@@ -42,12 +42,19 @@ export async function handleAuthPrintAccount(): Promise<void> {
   try {
     const account = await getAccount();
     if (!account) {
-      printError(ErrorCodes.AUTH_REQUIRED, 'Not authenticated. Run: ms-todo-cli auth login');
+      printError(ErrorCodes.AUTH_REQUIRED, `Profile "${getProfile()}": not authenticated. Run: ms-todo-cli --profile ${getProfile()} auth login`);
       return;
     }
-    printSuccess({ account });
+    printSuccess({ profile: getProfile(), account });
   } catch (err: unknown) {
-    const e = err as { code?: string; message?: string };
-    printError(e.code || ErrorCodes.GRAPH_ERROR, e.message || 'Unknown error');
+    reportError(err);
+  }
+}
+
+export async function handleAuthProfiles(): Promise<void> {
+  try {
+    printSuccess({ profile: getProfile(), profiles: await listProfiles() });
+  } catch (err: unknown) {
+    reportError(err);
   }
 }

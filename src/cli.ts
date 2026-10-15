@@ -1,15 +1,31 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { handleAuthLogin, handleAuthStatus, handleAuthLogout, handleAuthPrintAccount } from './auth';
+import { handleAuthLogin, handleAuthStatus, handleAuthLogout, handleAuthPrintAccount, handleAuthProfiles } from './auth';
 import { handleListCreate, handleListList } from './commands/list';
 import { handleTaskCreate, handleTaskUpdate, handleTaskComplete, handleTaskList, handleTaskGet, handleTaskSearch } from './commands/task';
 import { handleStepList, handleStepCreate, handleStepUpdate, handleStepComplete, handleStepDelete } from './commands/step';
 import { handleAttachmentUpload } from './commands/attachment';
 import { handleGroupCreate, handleGroupList, handleGroupUpdate, handleGroupDelete } from './commands/group';
 import { printError } from './output';
-import { ErrorCodes } from './errors';
+import { AppError, ErrorCodes } from './errors';
+import { resolveProfile, withProfile } from './profile';
 
-const program = new Command();
+class ProfileCommand extends Command {
+  createCommand(name?: string): Command {
+    return new ProfileCommand(name);
+  }
+
+  action(handler: Parameters<Command['action']>[0]): this {
+    return super.action((...args: unknown[]) => {
+      const command = args[args.length - 1] as Command;
+      const profile = resolveProfile(command.optsWithGlobals().profile);
+      return withProfile(profile, () => handler(...args));
+    });
+  }
+}
+
+export function createProgram(): Command {
+const program = new ProfileCommand();
 
 // Override Commander output to always emit JSON — suppress both stdout and stderr
 program.exitOverride();
@@ -21,14 +37,18 @@ program.configureOutput({
 program
   .name('ms-todo-cli')
   .description('Microsoft To Do CLI')
-  .version('0.1.0');
+  .version('0.1.0')
+  .option('--profile <alias>', 'Microsoft account profile (MS_TODO_PROFILE or default)');
 
 // Auth commands
 const auth = program.command('auth').description('Authentication commands');
-auth.command('login').description('Login to Microsoft account').action(handleAuthLogin);
+auth.command('login').description('Login to Microsoft account')
+  .option('--replace', 'Explicitly allow replacing the account bound to this profile')
+  .action((opts) => handleAuthLogin({ replace: opts.replace }));
 auth.command('status').description('Check authentication status').action(handleAuthStatus);
 auth.command('logout').description('Logout from Microsoft account').action(handleAuthLogout);
 auth.command('print-account').description('Print current account info').action(handleAuthPrintAccount);
+auth.command('profiles').description('List profiles and cached account identities').action(handleAuthProfiles);
 
 // List commands
 const listCmd = program.command('list').description('Todo list management commands');
@@ -195,9 +215,17 @@ program
   .option('--list-id <id>', 'List ID (skips list scan when provided)')
   .action((opts) => handleTaskGet(opts.taskId, opts.listId));
 
+return program;
+}
+
+export async function runCli(argv: string[] = process.argv): Promise<void> {
 try {
-  program.parse(process.argv);
+  await createProgram().parseAsync(argv);
 } catch (err: unknown) {
+  if (err instanceof AppError) {
+    printError(err.code, err.message);
+    return;
+  }
   if (err && typeof err === 'object' && 'code' in err) {
     const ce = err as { code: string; message: string };
     if (ce.code === 'commander.missingMandatoryOptionValue' || ce.code === 'commander.optionMissingArgument') {
@@ -210,4 +238,9 @@ try {
   } else {
     printError(ErrorCodes.VALIDATION_ERROR, String(err));
   }
+}
+}
+
+if (require.main === module) {
+  void runCli();
 }
