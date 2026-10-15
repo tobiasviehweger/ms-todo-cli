@@ -38,10 +38,10 @@ beforeEach(() => {
     if (url.endsWith('createUploadSession')) {
       return jsonResponse({ uploadUrl: 'https://graph.microsoft.com/upload' });
     }
-    if (url === 'https://graph.microsoft.com/v1.0/me/todo/lists') {
+    if (new URL(url).pathname.endsWith('/me/todo/lists')) {
       return jsonResponse({ value: [{ id: 'list', displayName: 'Tasks' }] });
     }
-    if (url === 'https://graph.microsoft.com/beta/me/outlook/taskGroups') {
+    if (new URL(url).pathname.endsWith('/me/outlook/taskGroups')) {
       return jsonResponse({ value: [] });
     }
     return jsonResponse({ value: [] });
@@ -116,7 +116,7 @@ test('maps Graph authentication and missing-resource errors', async () => {
   });
 
   mockFetch.mockResolvedValueOnce(jsonResponse({ error: { message: 'not found' } }, 404));
-  await expect(withProfile('work', () => getTasks('list'))).rejects.toMatchObject({
+  await expect(withProfile('work', () => getTasks('list', 'Tasks'))).rejects.toMatchObject({
     code: ErrorCodes.LIST_NOT_FOUND,
   });
 });
@@ -128,11 +128,11 @@ test('handles empty 204 responses for delete requests', async () => {
 
 test('pagination and concurrent cross-list requests retain their profile', async () => {
   const pages: Record<string, object> = {
-    '/me/todo/lists': { value: [{ id: 'one', displayName: 'One' }], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/lists-page-two' },
-    '/lists-page-two': { value: [{ id: 'two', displayName: 'Two' }] },
-    '/me/todo/lists/one/tasks': { value: [], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/tasks-page-two' },
-    '/tasks-page-two': { value: [] },
-    '/me/todo/lists/two/tasks': { value: [] },
+    '/v1.0/me/todo/lists': { value: [{ id: 'one', displayName: 'One' }], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/lists-page-two' },
+    '/v1.0/lists-page-two': { value: [{ id: 'two', displayName: 'Two' }] },
+    '/v1.0/me/todo/lists/one/tasks': { value: [], '@odata.nextLink': 'https://graph.microsoft.com/v1.0/tasks-page-two' },
+    '/v1.0/tasks-page-two': { value: [] },
+    '/v1.0/me/todo/lists/two/tasks': { value: [] },
   };
   mockFetch.mockImplementation(async (input, init) => {
     const url = String(input);

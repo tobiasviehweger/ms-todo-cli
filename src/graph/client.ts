@@ -16,10 +16,10 @@ interface GraphResponse<T> {
 }
 
 interface GraphClient {
-  get<T = any>(url: string, config?: { params?: Record<string, string> }): Promise<GraphResponse<T>>;
-  post<T = any>(url: string, data?: unknown): Promise<GraphResponse<T>>;
-  patch<T = any>(url: string, data?: unknown): Promise<GraphResponse<T>>;
-  delete<T = any>(url: string): Promise<GraphResponse<T>>;
+  get<T = unknown>(url: string, config?: { params?: Record<string, string> }): Promise<GraphResponse<T>>;
+  post<T = unknown>(url: string, data?: unknown): Promise<GraphResponse<T>>;
+  patch<T = unknown>(url: string, data?: unknown): Promise<GraphResponse<T>>;
+  delete<T = unknown>(url: string): Promise<GraphResponse<T>>;
 }
 
 function createGraphClient(baseURL: string): GraphClient {
@@ -31,7 +31,9 @@ function createGraphClient(baseURL: string): GraphClient {
     params?: Record<string, string>,
   ): Promise<GraphResponse<T>> => {
     const token = await withProfile(profile, () => acquireAccessToken());
-    const url = new URL(rawUrl, baseURL);
+    const url = /^https?:\/\//i.test(rawUrl)
+      ? new URL(rawUrl)
+      : new URL(`${baseURL.replace(/\/+$/, '')}/${rawUrl.replace(/^\/+/, '')}`);
     if (params) {
       for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
     }
@@ -49,7 +51,7 @@ function createGraphClient(baseURL: string): GraphClient {
       throw new AppError(ErrorCodes.GRAPH_ERROR, err instanceof Error ? err.message : String(err));
     }
     const text = response.status === 204 ? '' : await response.text();
-    let data: any;
+    let data: unknown;
     if (text) {
       try {
         data = JSON.parse(text);
@@ -63,16 +65,22 @@ function createGraphClient(baseURL: string): GraphClient {
         throw new AppError(ErrorCodes.AUTH_EXPIRED, `Authentication expired or invalid for profile "${profile}". Run: ms-todo-cli auth login --profile ${profile}`);
       }
       if (response.status === 404) throw mapNotFoundError(normalizeGraphUrl(rawUrl, baseURL));
-      throw new AppError(ErrorCodes.GRAPH_ERROR, data?.error?.message || response.statusText || `HTTP ${response.status}`);
+      const error = data && typeof data === 'object' && 'error' in data ? data.error : undefined;
+      const message = error && typeof error === 'object' && 'message' in error ? error.message : undefined;
+      throw new AppError(
+        ErrorCodes.GRAPH_ERROR,
+        typeof message === 'string' ? message : response.statusText || `HTTP ${response.status}`,
+      );
     }
-    return { data, status: response.status, headers: response.headers };
+    return { data: data as T, status: response.status, headers: response.headers };
   };
-  return {
+  const client: GraphClient = {
     get: <T>(url: string, config?: { params?: Record<string, string> }) => request<T>('GET', url, undefined, config?.params),
     post: <T>(url: string, data?: unknown) => request<T>('POST', url, data),
     patch: <T>(url: string, data?: unknown) => request<T>('PATCH', url, data),
     delete: <T>(url: string) => request<T>('DELETE', url),
   };
+  return client;
 }
 
 function normalizeGraphUrl(rawUrl: string, baseUrl: string = BASE_URL): string {
@@ -170,7 +178,7 @@ async function fetchPaged<TInput, TOutput>(
   const results: TOutput[] = [];
   let nextUrl: string | undefined = url;
   while (nextUrl) {
-    const res = await client.get<ODataPage<TInput>>(nextUrl);
+    const res: GraphResponse<ODataPage<TInput>> = await client.get<ODataPage<TInput>>(nextUrl);
     for (const item of res.data.value || []) {
       results.push(mapItem(item));
     }
@@ -202,7 +210,7 @@ async function fetchSearchTasksForList(
   let isFirstRequest = true;
 
   while (nextUrl) {
-    const res = await client.get<ODataPage<GraphTask>>(
+    const res: GraphResponse<ODataPage<GraphTask>> = await client.get<ODataPage<GraphTask>>(
       nextUrl,
       isFirstRequest ? { params } : undefined,
     );
@@ -239,7 +247,7 @@ export async function getListGroupByName(name: string): Promise<TodoListGroup | 
 
 export async function createListGroup(displayName: string): Promise<TodoListGroup> {
   const client = createBetaClient();
-  const res = await client.post('/me/outlook/taskGroups', { name: displayName });
+  const res = await client.post<OutlookTaskGroup>('/me/outlook/taskGroups', { name: displayName });
   return mapOutlookGroup(res.data);
 }
 
@@ -248,7 +256,7 @@ export async function updateListGroup(listGroupId: string, updates: { displayNam
     throw new AppError(ErrorCodes.VALIDATION_ERROR, 'displayName is required');
   }
   const client = createBetaClient();
-  const res = await client.patch(`/me/outlook/taskGroups/${listGroupId}`, { name: updates.displayName.trim() });
+  const res = await client.patch<OutlookTaskGroup>(`/me/outlook/taskGroups/${listGroupId}`, { name: updates.displayName.trim() });
   return mapOutlookGroup(res.data);
 }
 
@@ -259,7 +267,7 @@ export async function deleteListGroup(listGroupId: string): Promise<void> {
 
 export async function getLists(client?: GraphClient): Promise<TodoList[]> {
   const activeClient = client ?? createClient();
-  const res = await activeClient.get('/me/todo/lists');
+  const res = await activeClient.get<{ value: TodoList[] }>('/me/todo/lists');
   return res.data.value;
 }
 
@@ -270,7 +278,7 @@ export async function getListByName(name: string): Promise<TodoList | null> {
 
 export async function createList(displayName: string): Promise<TodoList> {
   const client = createClient();
-  const res = await client.post('/me/todo/lists', { displayName });
+  const res = await client.post<TodoList>('/me/todo/lists', { displayName });
   return res.data;
 }
 
@@ -281,7 +289,7 @@ export async function getTasks(listId: string, listName?: string): Promise<TodoT
     const list = lists.find((l) => l.id === listId);
     listName = list?.displayName;
   }
-  const res = await client.get(`/me/todo/lists/${listId}/tasks`);
+  const res = await client.get<{ value?: GraphTask[] }>(`/me/todo/lists/${listId}/tasks`);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (res.data.value || []).map((t: any) => mapTask(t, listName, listId));
 }
@@ -310,7 +318,7 @@ async function fetchTaskRaw(
   taskId: string,
   listName?: string,
 ): Promise<TodoTask> {
-  const res = await client.get(`/me/todo/lists/${listId}/tasks/${taskId}`);
+  const res = await client.get<GraphTask>(`/me/todo/lists/${listId}/tasks/${taskId}`);
   return mapTask(res.data, listName, listId);
 }
 
@@ -331,7 +339,7 @@ export async function createTask(listId: string, task: object, listName?: string
     const list = lists.find((l) => l.id === listId);
     listName = list?.displayName;
   }
-  const res = await client.post(`/me/todo/lists/${listId}/tasks`, task);
+  const res = await client.post<GraphTask>(`/me/todo/lists/${listId}/tasks`, task);
   return mapTask(res.data, listName, listId);
 }
 
@@ -342,7 +350,7 @@ export async function updateTask(listId: string, taskId: string, updates: object
     const list = lists.find((l) => l.id === listId);
     listName = list?.displayName;
   }
-  const res = await client.patch(`/me/todo/lists/${listId}/tasks/${taskId}`, updates);
+  const res = await client.patch<GraphTask>(`/me/todo/lists/${listId}/tasks/${taskId}`, updates);
   return mapTask(res.data, listName, listId);
 }
 
@@ -392,13 +400,13 @@ function mapChecklistItem(item: any): ChecklistItem {
 
 export async function getChecklistItems(listId: string, taskId: string): Promise<ChecklistItem[]> {
   const client = createClient();
-  const res = await client.get(`/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`);
+  const res = await client.get<{ value?: ChecklistItem[] }>(`/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`);
   return (res.data.value || []).map(mapChecklistItem);
 }
 
 export async function createChecklistItem(listId: string, taskId: string, displayName: string): Promise<ChecklistItem> {
   const client = createClient();
-  const res = await client.post(`/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`, { displayName });
+  const res = await client.post<ChecklistItem>(`/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`, { displayName });
   return mapChecklistItem(res.data);
 }
 
@@ -409,7 +417,7 @@ export async function updateChecklistItem(
   updates: { displayName?: string; isChecked?: boolean },
 ): Promise<ChecklistItem> {
   const client = createClient();
-  const res = await client.patch(
+  const res = await client.patch<ChecklistItem>(
     `/me/todo/lists/${listId}/tasks/${taskId}/checklistItems/${checklistItemId}`,
     updates,
   );
@@ -432,7 +440,7 @@ export async function uploadAttachment(
   const contentBytes = Buffer.from(attachment.contentBytes, 'base64');
   const fileSize = contentBytes.length;
 
-  const sessionRes = await betaClient.post(
+  const sessionRes = await betaClient.post<{ uploadUrl: string }>(
     `/me/todo/lists/${listId}/tasks/${taskId}/attachments/createUploadSession`,
     {
       attachmentInfo: {
