@@ -27,12 +27,12 @@ class ProfileCommand extends Command {
 export function createProgram(): Command {
 const program = new ProfileCommand();
 
-// Override Commander output to always emit JSON — suppress both stdout and stderr
+// Keep help/version output, but report command errors as JSON in runCli.
 program.exitOverride();
 program.configureOutput({
-  writeOut: () => { /* suppress Commander's default stdout (help/version text) */ },
-  writeErr: () => { /* suppress Commander's default stderr */ },
+  outputError: () => { /* suppress Commander's plain-text error diagnostics */ },
 });
+program.configureHelp({ showGlobalOptions: true });
 
 program
   .name('ms-todo-cli')
@@ -227,11 +227,11 @@ try {
     return;
   }
   if (err && typeof err === 'object' && 'code' in err) {
-    const ce = err as { code: string; message: string };
+    const ce = err as { code: string; message: string; exitCode: number };
     if (ce.code === 'commander.missingMandatoryOptionValue' || ce.code === 'commander.optionMissingArgument') {
       printError(ErrorCodes.VALIDATION_ERROR, ce.message);
-    } else if (ce.code === 'commander.helpDisplayed' || ce.code === 'commander.version') {
-      process.exit(0);
+    } else if (ce.code === 'commander.helpDisplayed' || ce.code === 'commander.version' || ce.code === 'commander.help') {
+      process.exit(ce.exitCode);
     } else {
       printError(ErrorCodes.VALIDATION_ERROR, ce.message);
     }
