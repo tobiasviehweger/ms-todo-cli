@@ -29,6 +29,20 @@ npm run build
 npm link
 ```
 
+## Help
+
+Run `ms-todo-cli --help` (or `-h`) to see available commands. Add `--help` to
+any command to see its parameters:
+
+```bash
+ms-todo-cli task --help
+ms-todo-cli task create --help
+```
+
+Running without a command, or with only a command group such as `ms-todo-cli task`,
+prints usage help to stderr and exits with code 1. Explicit help and `--version`
+print to stdout and exit successfully; neither requires authentication.
+
 ## Azure App Registration
 
 To use this CLI, you need to register an application in Azure Active Directory:
@@ -304,7 +318,8 @@ ms-todo-cli get --task-id "TASK_ID"
 
 ## Output Format
 
-All output is valid JSON. Success responses have `ok: true`:
+Command responses are valid JSON; help and version output are plain text.
+Success responses have `ok: true`:
 
 ```json
 {"ok":true,"task":{"id":"...","title":"Buy milk","status":"notStarted"}}
